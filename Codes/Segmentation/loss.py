@@ -6,164 +6,161 @@ from monai.networks.utils import one_hot
 from monai.utils import LossReduction
 from monai.metrics.utils import get_surface_distance
 from monai.metrics import compute_average_surface_distance
-from typing import Tuple, Union, List, Dict, Any
+import numpy as np
+import scipy.ndimage as nd
+
 
 class VolumeAwareLoss(nn.Module):
     def __init__(
         self,
-        include_background: bool = False,
-        to_onehot_y: bool = True,
-        softmax: bool = True,
-        tversky_alpha: float = 0.3,
-        tversky_beta: float = 0.7,
-        class_weights=[1.0, 2.0, 1.5, 2.5, 1.5],
-        baseline_volumes=[0.0, 2000.0, 8000.0, 1000.0, 3000.0],
-        epsilon: float = 1e-5,
-        reduction: str = "mean",
+        include_background=False,
+        softmax=True,
+        tversky_alpha=0.3,
+        tversky_beta=0.7,
+        class_weights=None,
+        baseline_volumes=None,
+        epsilon=1e-5,
+        reduction="mean",
     ):
         super().__init__()
         self.include_background = include_background
-        self.to_onehot_y = to_onehot_y
         self.softmax = softmax
-        self.tversky_alpha = tversky_alpha
-        self.tversky_beta = tversky_beta
         self.epsilon = epsilon
         self.reduction = reduction
 
+        cw = class_weights or [1.0, 2.0, 1.5, 2.5, 1.5]
+        bv = baseline_volumes or [0.0, 2000.0, 8000.0, 1000.0, 3000.0]
+        self.n_classes = len(cw)
+
+        # Always expect one-hot inputs => disable MONAI's internal one-hot
         self.dice_ce = DiceCELoss(
             include_background=include_background,
             to_onehot_y=False,
             softmax=softmax,
             lambda_dice=0.5,
             lambda_ce=0.5,
-            reduction=LossReduction.MEAN
+            reduction=LossReduction.MEAN,
         )
-
         self.tversky = TverskyLoss(
             include_background=include_background,
             to_onehot_y=False,
             softmax=softmax,
             alpha=tversky_alpha,
             beta=tversky_beta,
-            reduction=LossReduction.MEAN
+            reduction=LossReduction.MEAN,
         )
 
-        self.register_buffer("static_weights", torch.tensor(class_weights, dtype=torch.float32))
-        self.register_buffer("baseline_volumes", torch.tensor(baseline_volumes, dtype=torch.float32))
-        self.n_classes = len(class_weights)
+        self.register_buffer("static_w", torch.tensor(cw, dtype=torch.float32))
+        self.register_buffer("baseline_w", torch.tensor(bv, dtype=torch.float32))
 
     def _compute_dynamic_weights(self, onehot):
-        volumes = torch.sum(onehot, dim=(2, 3, 4))
-        total_volumes = torch.clamp(torch.sum(volumes, dim=1, keepdim=True), min=self.epsilon)
-        relative_volumes = volumes / total_volumes
-        volume_multipliers = torch.sqrt(self.baseline_volumes / torch.clamp(volumes, min=self.epsilon))
-        volume_multipliers = torch.clamp(volume_multipliers, max=3.0)
-        effective_weights = self.static_weights * volume_multipliers
-        norm_factors = torch.sum(effective_weights, dim=1, keepdim=True) / self.n_classes
-        normalized_weights = effective_weights / torch.clamp(norm_factors, min=self.epsilon)
-        return normalized_weights
+        vols = onehot.sum(dim=(2,3,4))                               # [B, C]
+        mult = torch.sqrt(self.baseline_w / torch.clamp(vols, min=self.epsilon))
+        mult = torch.clamp(mult, max=3.0)
+        eff = self.static_w * mult                                  # [C]
+        norm = eff.sum(dim=0, keepdim=True) / self.n_classes        # [1, C]
+        return eff / torch.clamp(norm, min=self.epsilon)            # [C]
 
-    def _compute_surface_loss(self, pred, target, weights):
-        pred_bin = (pred > 0.5).float()
-        B, C = pred.shape[:2]
-        losses = torch.zeros(B, device=pred.device)
+    def compute_surface_loss(
+        self,
+        pred_probs,        # [B, C, D, H, W], softmaxed probabilities
+        onehot_target,     # [B, C, D, H, W], your one-hot GT
+        weights            # [C], normalized class weights
+    ):
+        """
+        Returns a tensor of shape [B], the per‐sample weighted surface loss.
+        """
+        B, C, D, H, W = pred_probs.size()
+        losses = torch.zeros(B, device=pred_probs.device)
+
+        # binarize predictions at 0.5 threshold
+        pred_bin = (pred_probs > 0.5).cpu().numpy()
+
+        # move onehot_target to CPU numpy for boundary ops
+        gt_bin = onehot_target.cpu().numpy().astype(bool)
+
         for b in range(B):
-            loss = 0.0
+            sample_loss = 0.0
             for c in range(C):
                 if not self.include_background and c == 0:
                     continue
-                pred_c = pred_bin[b, c].cpu().numpy().astype(bool)
-                target_c = target[b, c].cpu().numpy().astype(bool)
-                if not target_c.any() and not pred_c.any():
+
+                pm = pred_bin[b, c]  # binary 3D mask
+                tm = gt_bin[b, c]    # binary 3D mask
+
+                # compute boundary voxels via erosion difference
+                struct = np.ones((3,3,3), dtype=bool)
+                pm_eroded = nd.binary_erosion(pm, structure=struct)
+                tm_eroded = nd.binary_erosion(tm, structure=struct)
+                pm_bd = pm ^ pm_eroded
+                tm_bd = tm ^ tm_eroded
+
+                # if neither has boundary, skip
+                if not pm_bd.any() and not tm_bd.any():
                     continue
-                if not target_c.any() or not pred_c.any():
-                    loss += weights[b, c] * 10.0
+
+                # if one has no boundary at all, penalize heavily
+                if not pm_bd.any() or not tm_bd.any():
+                    sample_loss += weights[c] * 10.0
                     continue
-                dist = get_surface_distance(target_c, pred_c, spacing=(1, 1, 1), distance_metric="euclidean")
-                avg = compute_average_surface_distance(dist)
-                mean_surface = (avg[0] + avg[1]) / 2.0
-                loss += weights[b, c] * mean_surface
-            losses[b] = loss / (C if self.include_background else C - 1)
-        return losses
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> Dict[str, torch.Tensor]:
+                # average the two directional maps
+                avg_d = compute_average_surface_distance(pm,tm)
+              
+                # accumulate weighted class loss
+                sample_loss += weights[c] * avg_d
+
+            # normalize by number of considered classes
+            nc = C if self.include_background else (C - 1)
+            losses[b] = sample_loss / nc
+
+        return losses  # [B]
+
+    def forward(self, pred, target):
         """
-        Compute the composite loss.
-
-        Args:
-            pred: Model predictions (B, C, H, W, D)
-            target: Ground truth labels (B, H, W, D) or one-hot (B, C, H, W, D)
-
-        Returns:
-            Dictionary of all individual and final loss components.
+        pred   : [B, C, D, H, W] logits
+        target : [B, C, D, H, W] one-hot
         """
-        # Determine target format
-        if target.dim() == pred.dim():  # one-hot
-            y_onehot = target
-            target_indices = torch.argmax(target, dim=1)  # Convert for MONAI loss
-        elif target.dim() == pred.dim() - 1:  # class indices
-            target_indices = target.long()
-            y_onehot = one_hot(target_indices, num_classes=self.n_classes)
-        else:
-            raise ValueError(f"[ERROR] Target shape must be [B,C,...] or [B,...], got {target.shape}")
+        assert pred.dim()==5 and target.dim()==5, f"Both pred and target must be 5-D, got {pred.shape} and {target.shape}"
 
-        # Ensure prediction is float and apply softmax for surface loss
-        pred_softmax = F.softmax(pred, dim=1) if self.softmax else pred
-        pred = pred.float()
+        # dynamic weights per class (same for all batch samples)
+        W = self._compute_dynamic_weights(target)  # [C]
 
-        # Compute dynamic class weights based on volume
-        normalized_weights = self._compute_dynamic_weights(y_onehot)
+        # MONAI losses with reduction NONE
+        dice_map = self.dice_ce(pred, target)    # [B, C]
+        tversky_map = self.tversky(pred, target)    # [B, C]
 
-        # === MONAI LOSSES ===
-        # These expect: pred: [B,C,...], target: [B,...] or [B,1,...]
-        dice_ce_loss = self.dice_ce(pred, target_indices)
-        tversky_loss = self.tversky(pred, target_indices)
+        # apply weights
+        wd = (dice_map * W).sum(dim=1)  # [B]
+        wt = (tversky_map * W).sum(dim=1)  # [B]      
+        
+        # compute surface loss
+        probs = F.softmax(pred, dim=1) if self.softmax else pred
+        ws = self.compute_surface_loss(
+                probs,
+                target,
+                self.static_w
+            )
 
-        # Apply class weights
-        weighted_dice = (dice_ce_loss * normalized_weights).sum(dim=1)  # [B]
-        weighted_tversky = (tversky_loss * normalized_weights).sum(dim=1)  # [B]
+        total = 0.4*wd + 0.4*wt + 0.2*ws
 
-        # === CUSTOM SURFACE LOSS ===
-        surface_loss = self._compute_surface_loss(pred_softmax, y_onehot, normalized_weights)
-
-        # Combine losses
-        total_loss = (
-            0.4 * weighted_dice +
-            0.4 * weighted_tversky +
-            0.2 * surface_loss
-        )
-
-        # Final reduction
-        if self.reduction == "mean":
+        if self.reduction=="mean":
             return {
-                "loss": total_loss.mean(),
-                "dice_ce_loss": weighted_dice.mean(),
-                "tversky_loss": weighted_tversky.mean(),
-                "surface_loss": surface_loss.mean(),
-                "per_sample_loss": total_loss,
-                "normalized_weights": normalized_weights
-            }
-        elif self.reduction == "sum":
-            return {
-                "loss": total_loss.sum(),
-                "dice_ce_loss": weighted_dice.sum(),
-                "tversky_loss": weighted_tversky.sum(),
-                "surface_loss": surface_loss.sum(),
-                "per_sample_loss": total_loss,
-                "normalized_weights": normalized_weights
-            }
+                    "loss":         total.mean(),
+                    "dice_ce_loss": wd.mean(),
+                    "tversky_loss": wt.mean(),
+                    "surface_loss": ws.mean(),
+                }
         else:
             return {
-                "loss": total_loss,
-                "dice_ce_loss": weighted_dice,
-                "tversky_loss": weighted_tversky,
-                "surface_loss": surface_loss,
-                "per_sample_loss": total_loss,
-                "normalized_weights": normalized_weights
-            }
+                    "loss": total,
+                    "dice_ce_loss": wd,
+                    "tversky_loss": wt,
+                    "surface_loss": ws,
+                }
+
 
 def get_brats_loss():
     return VolumeAwareLoss()
-
 
 
