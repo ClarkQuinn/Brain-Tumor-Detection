@@ -64,7 +64,7 @@ class VolumeAwareLoss(nn.Module):
             softmax=softmax,
             lambda_dice=0.5,
             lambda_ce=0.5,
-            reduction=LossReduction.MEAN_BATCH,  # Changed to get per-batch losses
+            reduction=LossReduction.MEAN,  # Changed to get per-batch losses
         )
         self.tversky = TverskyLoss(
             include_background=include_background,
@@ -72,7 +72,7 @@ class VolumeAwareLoss(nn.Module):
             softmax=softmax,
             alpha=tversky_alpha,
             beta=tversky_beta,
-            reduction=LossReduction.MEAN_BATCH,  # Changed to get per-batch losses
+            reduction=LossReduction.MEAN,  # Changed to get per-batch losses
         )
 
         # Register buffers for class weights and baseline volumes
